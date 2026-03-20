@@ -1,18 +1,11 @@
 """
 Copyright 2022 GamingCoookie
-Copyright 2025 Rufemlike
+Copyright 2026 Rufemlike
+Multi-Port Game Server IPv6 to IPv4 Proxy with TCP/UDP Support
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
 import socket
@@ -20,281 +13,596 @@ import re
 import selectors
 import os
 import pickle
+import json
+import argparse
+import struct
+import ipaddress
+import threading
 from threading import Thread
 import time
+import sys
+import queue
+import signal
+from typing import Dict, List, Tuple, Optional
 
 
-def safe_send(conn, msg):
-    """
-    Safely send data to a socket, handling blocking IO errors
-    For non-blocking sockets, wait until socket is ready for writing
-    """
-    if not msg:
-        return
+class TCPProxyHandler:
+    """Handles TCP connections for a specific port"""
 
-    print(f"Sending {len(msg)} bytes")
-
-    try:
-        msg_len = len(msg)
-        totalsent = 0
-
-        while totalsent < msg_len:
-            try:
-                # Try to send data
-                sent = conn.send(msg[totalsent:])
-                if sent == 0:
-                    raise RuntimeError("socket connection broken")
-                totalsent += sent
-            except BlockingIOError:
-                # Socket not ready for writing, wait briefly
-                time.sleep(0.001)
-                continue
-    except Exception as e:
-        print(f"Error in safe_send: {e}")
-
-
-def clear_screen():
-    """Clear console screen (cross-platform)"""
-    os.system('cls' if os.name == 'nt' else 'clear')
-    print('Simple Reverse IPv6 to IPv4 TCP proxy\nVersion 1.0')
-    print('-' * 100)
-
-
-class ReverseProxy(Thread):
-    """
-    Reverse proxy thread that handles IPv6 to IPv4 connections
-    Listens on IPv6 address and forwards traffic to local IPv4 server
-    """
-
-    def __init__(self, addr: str = None, port: int = None, standalone: bool = False):
-        # Address to bind to (host, port)
-        self.addr = (addr, port) if addr is not None else None
-        # Target port to forward to
-        self.port = port
-        # Whether to run in standalone mode (with user interface)
-        self.standalone = standalone
-        # Selector for handling multiple sockets
+    def __init__(self, listen_port: int, target_host: str, target_port: int,
+                 preserve_ip: bool = True, proxy_protocol: bool = True):
+        self.listen_port = listen_port
+        self.target_host = target_host
+        self.target_port = target_port
+        self.preserve_ip = preserve_ip
+        self.proxy_protocol = proxy_protocol
         self.sel = None
-        # Flag to control proxy running state
         self.running = True
+        self.client_ips = {}
 
-        Thread.__init__(self, name=f'{addr=} {port=}')
-        self.daemon = True  # Thread will exit when main program exits
-
-    def accept_connection(self, sock):
-        """Accept new client connection and create connection to local server"""
-        try:
-            # Accept new client connection
-            client, addr = sock.accept()
-            print(f"New connection from {addr}")
-            client.setblocking(False)
-
-            # Create connection to local IPv4 server
-            server = socket.create_connection(("127.0.0.1", self.port))
-            server.setblocking(False)
-
-            # Register both sockets with selector for reading events
-            # Client -> read_from_client, Server -> read_from_server
-            self.sel.register(client, selectors.EVENT_READ,
-                              (self.read_from_client, client, server))
-            self.sel.register(server, selectors.EVENT_READ,
-                              (self.read_from_server, client, server))
-
-        except Exception as e:
-            print(f"Error accepting connection: {e}")
-
-    def read_from_client(self, client, server):
-        """Read data from client, replace IPv6 address with localhost, send to server"""
-        try:
-            # Read data from client socket
-            data = client.recv(4096)
-            if data:
-                # Replace IPv6 address in HTTP Host header with localhost:port
-                ip6 = re.compile(f'\\[[^]]*]:{self.port}')
-                str_data = data.decode('ISO-8859-1', 'ignore')
-                ipm = ip6.search(str_data)
-                if ipm:
-                    # Replace IPv6 address with 127.0.0.1
-                    str_data = str_data.replace(str_data[ipm.start():ipm.end()],
-                                                f'127.0.0.1:{self.port}')
-                    data = str_data.encode('ISO-8859-1')
-
-                print(f"Client -> Server: {len(data)} bytes")
-                # Forward modified data to server
-                safe_send(server, data)
-            else:
-                # Client closed connection (received empty data)
-                print("Client closed connection")
-                self.close_connection(client, server)
-        except (ConnectionResetError, ConnectionAbortedError):
-            print("Client connection lost")
-            self.close_connection(client, server)
-        except Exception as e:
-            print(f"Error reading from client: {e}")
-            self.close_connection(client, server)
-
-    def read_from_server(self, client, server):
-        """Read data from server and forward to client"""
-        try:
-            # Read data from server socket
-            data = server.recv(4096)
-            if data:
-                print(f"Server -> Client: {len(data)} bytes")
-                # Forward data to client (no modification needed)
-                safe_send(client, data)
-            else:
-                # Server closed connection
-                print("Server closed connection")
-                self.close_connection(client, server)
-        except (ConnectionResetError, ConnectionAbortedError):
-            print("Server connection lost")
-            self.close_connection(client, server)
-        except Exception as e:
-            print(f"Error reading from server: {e}")
-            self.close_connection(client, server)
-
-    def close_connection(self, client, server):
-        """Cleanup connection: unregister from selector and close sockets"""
-        try:
-            self.sel.unregister(client)
-        except Exception:
-            pass
-
-        try:
-            self.sel.unregister(server)
-        except Exception:
-            pass
-
-        try:
-            client.close()
-        except Exception:
-            pass
-
-        try:
-            server.close()
-        except Exception:
-            pass
-
-    def run(self):
-        """Main proxy thread execution"""
-        if self.standalone:
-            clear_screen()
-            # Try to load configuration from file
-            try:
-                config_file = open('config.txt', 'rb')
-                self.addr = pickle.loads(config_file.read())
-                config_file.close()
-            except FileNotFoundError:
-                pass  # Config file doesn't exist
-            except EOFError:
-                self.addr = None  # Config file is empty
-
-            # If no config loaded, ask user for configuration
-            if not self.addr:
-                self.port = input("Which port do you want? (Default: 7245)\nEnter: ")
-                if self.port:
-                    self.port = int(self.port)
-                else:
-                    self.port = 7245
-
-                # Get available IPv6 addresses
-                try:
-                    addrs = socket.getaddrinfo(socket.gethostname(), self.port,
-                                               family=socket.AF_INET6)
-                    # Filter out link-local addresses (fe80::)
-                    valid_addrs = []
-                    for addr in addrs:
-                        if not addr[4][0].startswith('fe80'):
-                            valid_addrs.append(addr)
-
-                    # Let user choose address if multiple available
-                    if len(valid_addrs) > 1:
-                        print("Please select which address to bind to:")
-                        for i, addr in enumerate(valid_addrs):
-                            print(f"[{i + 1}] {addr[4][0]}")
-                        selection = int(input("Enter: ")) - 1
-                        self.addr = valid_addrs[selection][4][:2]
-                    elif valid_addrs:
-                        self.addr = valid_addrs[0][4][:2]
-                    else:
-                        print("No valid IPv6 addresses found!")
-                        return
-                except Exception as e:
-                    print(f"Error getting addresses: {e}")
-                    return
-
-                # Ask if user wants to save configuration
-                if input('Do you want to save config for next time?(Y/N)\nEnter: ').upper() == 'Y':
-                    try:
-                        config_file = open('config.txt', 'wb')
-                        config_file.write(pickle.dumps(self.addr))
-                        config_file.close()
-                    except Exception as e:
-                        print(f"Error saving config: {e}")
-
-                    clear_screen()
-
-            print(f"Reverse Proxy is up and running on [{self.addr[0]}] with port {self.addr[1]}")
-
-        # Create selector for handling multiple connections
+    def start(self):
+        """Start TCP proxy for this port"""
         self.sel = selectors.DefaultSelector()
 
         try:
-            # Create IPv6 listening socket
-            ipv6side = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            # Allow address reuse (helpful for quick restarts)
-            ipv6side.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            # Bind to specified address and port
-            ipv6side.bind(self.addr)
-            # Listen for incoming connections
-            ipv6side.listen(20)
-            # Set non-blocking mode
-            ipv6side.setblocking(False)
+            # Create listening socket (IPv4 for client mode, IPv6 for server mode)
+            # We'll create both and let the main manager decide which to use
+            self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_sock.bind(('0.0.0.0', self.listen_port))
+            self.server_sock.listen(100)
+            self.server_sock.setblocking(False)
 
-            # Register listening socket with selector
-            self.sel.register(ipv6side, selectors.EVENT_READ, self.accept_connection)
+            self.sel.register(self.server_sock, selectors.EVENT_READ, self.accept_connection)
 
-            print(f"Proxy server started successfully on [{self.addr[0]}]:{self.addr[1]}")
+            print(f"TCP Proxy listening on 0.0.0.0:{self.listen_port} -> {self.target_host}:{self.target_port}")
+            if self.preserve_ip:
+                print(
+                    f"  - Preserving original client IP using {'PROXY protocol' if self.proxy_protocol else 'custom headers'}")
 
-            # Main event loop
+            # Main loop
             while self.running:
                 try:
-                    # Wait for socket events with 1 second timeout
                     events = self.sel.select(timeout=1.0)
                     for key, mask in events:
                         callback = key.data
                         if isinstance(callback, tuple):
-                            # Data handler callback (read_from_client/read_from_server)
                             callback[0](callback[1], callback[2])
                         else:
-                            # Connection acceptor callback
                             callback(key.fileobj)
-                except KeyboardInterrupt:
-                    print("\nShutting down...")
-                    self.running = False
-                    break
                 except Exception as e:
-                    print(f"Error in select loop: {e}")
-                    time.sleep(1)
+                    print(f"Error in TCP proxy loop for port {self.listen_port}: {e}")
+                    time.sleep(0.1)
 
         except Exception as e:
-            print(f"Error starting proxy server: {e}")
+            print(f"Error starting TCP proxy on port {self.listen_port}: {e}")
         finally:
-            # Cleanup: close all sockets and selector
-            if self.sel:
-                for key in list(self.sel.get_map().values()):
-                    try:
-                        key.fileobj.close()
-                    except:
-                        pass
-                self.sel.close()
+            self.cleanup()
+
+    def accept_connection(self, sock):
+        """Accept new TCP connection"""
+        try:
+            client, addr = sock.accept()
+            print(f"TCP: New connection on port {self.listen_port} from {addr}")
+            client.setblocking(False)
+
+            # Create connection to target
+            target = socket.create_connection((self.target_host, self.target_port))
+            target.setblocking(False)
+
+            # Store client info
+            self.client_ips[client.fileno()] = addr
+
+            # If preserving IP and using PROXY protocol, send header first
+            if self.preserve_ip and self.proxy_protocol:
+                proxy_header = f"PROXY TCP4 {addr[0]} {self.target_host} {addr[1]} {self.target_port}\r\n"
+                try:
+                    target.send(proxy_header.encode())
+                except:
+                    pass
+
+            # Register both sockets
+            self.sel.register(client, selectors.EVENT_READ,
+                              (self.forward_client_to_target, client, target))
+            self.sel.register(target, selectors.EVENT_READ,
+                              (self.forward_target_to_client, client, target))
+
+        except Exception as e:
+            print(f"Error accepting connection on port {self.listen_port}: {e}")
+
+    def forward_client_to_target(self, client, target):
+        """Forward data from client to target"""
+        try:
+            data = client.recv(4096)
+            if data:
+                print(f"TCP: Client -> Target ({self.listen_port}): {len(data)} bytes")
+
+                # If preserving IP but not using PROXY protocol, inject headers
+                if self.preserve_ip and not self.proxy_protocol and client.fileno() in self.client_ips:
+                    # Check if this is first packet (HTTP/SIP/RTSP etc)
+                    # Inject X-Forwarded-For header for HTTP
+                    if data.startswith(b'GET') or data.startswith(b'POST') or data.startswith(b'PUT'):
+                        data = data.replace(b'Host:',
+                                            f'X-Forwarded-For: {self.client_ips[client.fileno()][0]}\r\nHost:'.encode())
+
+                safe_send(target, data)
+            else:
+                self.close_connection(client, target)
+        except Exception as e:
+            print(f"Error forwarding client->target: {e}")
+            self.close_connection(client, target)
+
+    def forward_target_to_client(self, client, target):
+        """Forward data from target to client"""
+        try:
+            data = target.recv(4096)
+            if data:
+                print(f"TCP: Target -> Client ({self.listen_port}): {len(data)} bytes")
+                safe_send(client, data)
+            else:
+                self.close_connection(client, target)
+        except Exception as e:
+            print(f"Error forwarding target->client: {e}")
+            self.close_connection(client, target)
+
+    def close_connection(self, client, target):
+        """Close connection and cleanup"""
+        try:
+            if client.fileno() in self.client_ips:
+                del self.client_ips[client.fileno()]
+        except:
+            pass
+
+        for sock in [client, target]:
+            try:
+                self.sel.unregister(sock)
+                sock.close()
+            except:
+                pass
+
+    def cleanup(self):
+        """Cleanup all resources"""
+        if self.sel:
+            for key in list(self.sel.get_map().values()):
+                try:
+                    key.fileobj.close()
+                except:
+                    pass
+            self.sel.close()
+
+    def stop(self):
+        """Stop the proxy"""
+        self.running = False
+
+
+class UDPProxyHandler:
+    """Handles UDP traffic for a specific port"""
+
+    def __init__(self, listen_port: int, target_host: str, target_port: int,
+                 preserve_ip: bool = True, timeout: int = 60):
+        self.listen_port = listen_port
+        self.target_host = target_host
+        self.target_port = target_port
+        self.preserve_ip = preserve_ip
+        self.timeout = timeout
+        self.running = True
+        self.tunnels = {}
+        self.lock = threading.Lock()
+
+        # UDP sockets
+        self.ipv4_sock = None
+        self.ipv6_sock = None
+
+    def start(self):
+        """Start UDP proxy for this port"""
+        try:
+            # Create UDP socket (will be used in both directions)
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind(('0.0.0.0', self.listen_port))
+            self.sock.setblocking(False)
+
+            print(f"UDP Proxy listening on 0.0.0.0:{self.listen_port} -> {self.target_host}:{self.target_port}")
+            if self.preserve_ip:
+                print(f"  - Preserving original client IP in UDP packets")
+
+            # Main loop
+            while self.running:
+                try:
+                    # Receive UDP packet
+                    data, addr = self.sock.recvfrom(65535)
+                    self.handle_udp_packet(data, addr)
+                except BlockingIOError:
+                    time.sleep(0.001)
+                    continue
+                except Exception as e:
+                    print(f"Error in UDP proxy for port {self.listen_port}: {e}")
+                    time.sleep(0.1)
+
+        except Exception as e:
+            print(f"Error starting UDP proxy on port {self.listen_port}: {e}")
+        finally:
+            if self.sock:
+                self.sock.close()
+
+    def handle_udp_packet(self, data: bytes, addr: Tuple[str, int]):
+        """Handle incoming UDP packet"""
+        try:
+            # Check if this packet has our header (from client proxy)
+            if len(data) >= 8 and data[:4] == b'UDPP':
+                # Extract original client info
+                ip_type = data[4:5]
+                if ip_type == b'\x04':  # IPv4
+                    original_ip = socket.inet_ntoa(data[5:9])
+                    original_port = struct.unpack('>H', data[9:11])[0]
+                    payload = data[11:]
+                else:  # IPv6
+                    original_ip = socket.inet_ntop(socket.AF_INET6, data[5:21])
+                    original_port = struct.unpack('>H', data[21:23])[0]
+                    payload = data[23:]
+
+                print(
+                    f"UDP: Restored original client {original_ip}:{original_port} -> {self.target_host}:{self.target_port}")
+
+                # Forward to target with original IP info if preserving
+                if self.preserve_ip:
+                    # For game servers that support it, add custom header
+                    # For example, for some games, you can prepend the original IP
+                    payload = struct.pack('>I', original_port) + payload
+
+                # Send to target
+                self.sock.sendto(payload, (self.target_host, self.target_port))
+
+            else:
+                # Regular packet from local client
+                print(f"UDP: New packet from {addr} -> {self.target_host}:{self.target_port} ({len(data)} bytes)")
+
+                if self.preserve_ip:
+                    # Add header with original client info
+                    if '.' in addr[0]:
+                        ip_bytes = socket.inet_aton(addr[0])
+                        ip_type = b'\x04'
+                    else:
+                        ip_bytes = socket.inet_pton(socket.AF_INET6, addr[0])
+                        ip_type = b'\x06'
+
+                    port_bytes = struct.pack('>H', addr[1])
+                    header = b'UDPP' + ip_type + ip_bytes + port_bytes
+                    packet = header + data
+                else:
+                    packet = data
+
+                self.sock.sendto(packet, (self.target_host, self.target_port))
+
+        except Exception as e:
+            print(f"Error handling UDP packet: {e}")
+
+    def stop(self):
+        """Stop the UDP proxy"""
+        self.running = False
+        if self.sock:
+            self.sock.close()
+
+
+class MultiPortProxy:
+    """Manages multiple proxy instances for different ports"""
+
+    def __init__(self, config_file: str = 'proxy_config.json', mode: str = 'client'):
+        self.config_file = config_file
+        self.mode = mode
+        self.tcp_proxies = []
+        self.udp_proxies = []
+        self.running = True
+
+        # Load configuration
+        self.config = self.load_config()
+
+    def load_config(self) -> dict:
+        """Load configuration from JSON file"""
+        try:
+            with open(self.config_file, 'r') as f:
+                config = json.load(f)
+                print(f"Loaded configuration from {self.config_file}")
+                return config
+        except FileNotFoundError:
+            print(f"Config file {self.config_file} not found, using defaults")
+            return self.get_default_config()
+        except Exception as e:
+            print(f"Error loading config: {e}")
+            return self.get_default_config()
+
+    def get_default_config(self) -> dict:
+        """Return default configuration"""
+        return {
+            "mode": self.mode,
+            "remote_ipv6": "2001:db8::1",  # Remote IPv6 address for client mode
+            "ports": [
+                {
+                    "local": 2001,
+                    "remote": 2001,
+                    "protocol": "udp",
+                    "preserve_ip": True
+                },
+                {
+                    "local": 6122,
+                    "remote": 6122,
+                    "protocol": "tcp",
+                    "preserve_ip": True,
+                    "proxy_protocol": True
+                }
+            ]
+        }
+
+    def start_proxies(self):
+        """Start all proxy instances"""
+        if self.mode == 'client':
+            # Client mode: forward local ports to remote IPv6 server
+            remote_ipv6 = self.config.get('remote_ipv6', '::1')
+            ports = self.config.get('ports', [])
+
+            for port_config in ports:
+                local_port = port_config['local']
+                remote_port = port_config.get('remote', local_port)
+                protocol = port_config.get('protocol', 'tcp').lower()
+                preserve_ip = port_config.get('preserve_ip', True)
+
+                if protocol == 'tcp':
+                    proxy = TCPProxyHandler(
+                        listen_port=local_port,
+                        target_host=remote_ipv6,
+                        target_port=remote_port,
+                        preserve_ip=preserve_ip,
+                        proxy_protocol=port_config.get('proxy_protocol', True)
+                    )
+                    self.tcp_proxies.append(proxy)
+                    Thread(target=proxy.start, daemon=True).start()
+
+                elif protocol == 'udp':
+                    proxy = UDPProxyHandler(
+                        listen_port=local_port,
+                        target_host=remote_ipv6,
+                        target_port=remote_port,
+                        preserve_ip=preserve_ip
+                    )
+                    self.udp_proxies.append(proxy)
+                    Thread(target=proxy.start, daemon=True).start()
+
+                print(f"Started {protocol.upper()} proxy on port {local_port} -> {remote_ipv6}:{remote_port}")
+
+        else:
+            # Server mode: forward to local game servers
+            ports = self.config.get('ports', [])
+
+            for port_config in ports:
+                local_port = port_config.get('listen', port_config['local'])
+                remote_port = port_config['remote']
+                target_host = port_config.get('target_host', '127.0.0.1')
+                protocol = port_config.get('protocol', 'tcp').lower()
+                preserve_ip = port_config.get('preserve_ip', True)
+
+                if protocol == 'tcp':
+                    proxy = TCPProxyHandler(
+                        listen_port=local_port,
+                        target_host=target_host,
+                        target_port=remote_port,
+                        preserve_ip=preserve_ip,
+                        proxy_protocol=port_config.get('proxy_protocol', True)
+                    )
+                    self.tcp_proxies.append(proxy)
+                    Thread(target=proxy.start, daemon=True).start()
+
+                elif protocol == 'udp':
+                    proxy = UDPProxyHandler(
+                        listen_port=local_port,
+                        target_host=target_host,
+                        target_port=remote_port,
+                        preserve_ip=preserve_ip
+                    )
+                    self.udp_proxies.append(proxy)
+                    Thread(target=proxy.start, daemon=True).start()
+
+                print(f"Started {protocol.upper()} proxy on port {local_port} -> {target_host}:{remote_port}")
+
+    def stop(self):
+        """Stop all proxies"""
+        print("\nStopping all proxies...")
+        self.running = False
+
+        for proxy in self.tcp_proxies:
+            proxy.stop()
+
+        for proxy in self.udp_proxies:
+            proxy.stop()
+
+        print("All proxies stopped")
+
+
+def safe_send(conn, msg):
+    """Safely send data to a socket"""
+    if not msg:
+        return
+
+    try:
+        totalsent = 0
+        msg_len = len(msg)
+
+        while totalsent < msg_len:
+            sent = conn.send(msg[totalsent:])
+            if sent == 0:
+                raise RuntimeError("Socket connection broken")
+            totalsent += sent
+    except Exception as e:
+        print(f"Error in safe_send: {e}")
+
+
+def create_config_template():
+    """Create a template configuration file"""
+    config = {
+        "mode": "client",  # or "server"
+        "remote_ipv6": "2001:db8::1",  # Only used in client mode
+        "ports": [
+            {
+                "local": 2001,
+                "remote": 2001,
+                "protocol": "udp",
+                "preserve_ip": True,
+                "description": "UDP game port"
+            },
+            {
+                "local": 6122,
+                "remote": 6122,
+                "protocol": "tcp",
+                "preserve_ip": True,
+                "proxy_protocol": True,
+                "description": "TCP game port with PROXY protocol"
+            },
+            {
+                "local": 8080,
+                "remote": 80,
+                "protocol": "tcp",
+                "preserve_ip": True,
+                "proxy_protocol": False,
+                "description": "HTTP proxy without PROXY protocol"
+            }
+        ]
+    }
+
+    # For server mode, add target_host
+    server_config = {
+        "mode": "server",
+        "ports": [
+            {
+                "listen": 7245,
+                "remote": 2001,
+                "target_host": "192.168.1.100",
+                "protocol": "udp",
+                "preserve_ip": True,
+                "description": "Forward UDP 7245 to game server UDP 2001"
+            },
+            {
+                "listen": 7246,
+                "remote": 6122,
+                "target_host": "192.168.1.100",
+                "protocol": "tcp",
+                "preserve_ip": True,
+                "proxy_protocol": True,
+                "description": "Forward TCP 7246 to game server TCP 6122"
+            }
+        ]
+    }
+
+    with open('proxy_config_template.json', 'w') as f:
+        json.dump(config, f, indent=4)
+
+    with open('proxy_config_server_template.json', 'w') as f:
+        json.dump(server_config, f, indent=4)
+
+    print("Created configuration templates:")
+    print("  - proxy_config_template.json (client mode)")
+    print("  - proxy_config_server_template.json (server mode)")
+
+
+def interactive_setup():
+    """Interactive setup for multi-port proxy"""
+    print("\n" + "=" * 60)
+    print("Multi-Port IPv6 to IPv4 Proxy Setup")
+    print("=" * 60)
+
+    mode = input("Mode (client/server) [client]: ").strip().lower() or "client"
+
+    config = {
+        "mode": mode,
+        "ports": []
+    }
+
+    if mode == "client":
+        remote_ipv6 = input("Remote IPv6 address: ").strip()
+        config["remote_ipv6"] = remote_ipv6
+
+    print("\nConfigure ports (enter empty port to finish):")
+    port_num = 1
+
+    while True:
+        print(f"\nPort {port_num}:")
+        local_port = input("  Local port: ").strip()
+        if not local_port:
+            break
+
+        remote_port = input(f"  Remote port (default {local_port}): ").strip() or local_port
+        protocol = input("  Protocol (tcp/udp) [tcp]: ").strip().lower() or "tcp"
+        preserve_ip = input("  Preserve original IP? (y/n) [y]: ").strip().lower() or "y"
+
+        port_config = {
+            "local": int(local_port),
+            "remote": int(remote_port),
+            "protocol": protocol,
+            "preserve_ip": preserve_ip == 'y'
+        }
+
+        if mode == "server":
+            target_host = input("  Target host [127.0.0.1]: ").strip() or "127.0.0.1"
+            port_config["target_host"] = target_host
+
+            if protocol == "tcp":
+                proxy_protocol = input("  Use PROXY protocol? (y/n) [y]: ").strip().lower() or "y"
+                port_config["proxy_protocol"] = proxy_protocol == 'y'
+
+        config["ports"].append(port_config)
+        port_num += 1
+
+    if config["ports"]:
+        filename = input("\nSave config to [proxy_config.json]: ").strip() or "proxy_config.json"
+        with open(filename, 'w') as f:
+            json.dump(config, f, indent=4)
+        print(f"Configuration saved to {filename}")
+
+    return config
+
+
+def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description='Multi-Port IPv6 to IPv4 Game Server Proxy')
+    parser.add_argument('--mode', choices=['client', 'server'], help='Proxy mode')
+    parser.add_argument('--config', default='proxy_config.json', help='Configuration file')
+    parser.add_argument('--create-config', action='store_true', help='Create template configuration file')
+    parser.add_argument('--interactive', action='store_true', help='Run interactive setup')
+
+    args = parser.parse_args()
+
+    if args.create_config:
+        create_config_template()
+        return
+
+    if args.interactive:
+        config = interactive_setup()
+        if not config.get('ports'):
+            print("No ports configured, exiting.")
+            return
+        proxy = MultiPortProxy(args.config, config.get('mode', 'client'))
+        proxy.config = config
+    else:
+        proxy = MultiPortProxy(args.config, args.mode or 'client')
+
+    print("\n" + "=" * 60)
+    print("Multi-Port IPv6 to IPv4 Proxy")
+    print("=" * 60)
+    print(f"Mode: {proxy.mode.upper()}")
+    print(f"Configuration: {proxy.config_file}")
+    print("\nStarting proxies...")
+
+    try:
+        proxy.start_proxies()
+        print("\nProxy is running. Press Ctrl+C to stop.\n")
+
+        # Keep main thread alive
+        while proxy.running:
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n\nShutting down...")
+        proxy.stop()
+        print("Goodbye!")
 
 
 if __name__ == '__main__':
-    try:
-        # Create and start proxy in standalone mode
-        p = ReverseProxy(standalone=True)
-        p.start()
-        p.join()
-    except KeyboardInterrupt:
-        print("\nProxy server stopped.")
+    main()
