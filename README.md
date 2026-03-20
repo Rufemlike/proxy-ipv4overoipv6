@@ -118,24 +118,6 @@ python proxy.py --create-config
 }
 ```
 
-### Game config
-```json
-# For Minecraft server (server.properties)
-proxy-protocol=true
-
-# For Source Engine games (startup parameters)
-+sv_proxies 1 +net_public_adr <your_ipv6>
-
-# For Arma server (no additional config needed)
-# Just point game client to proxy address
-
-# For Nginx (web-based games)
-server {
-    listen 80 proxy_protocol;
-    set_real_ip_from 127.0.0.1;
-    real_ip_header proxy_protocol;
-}
-```
 
 ## Testing
 ### Check if ports are listening
